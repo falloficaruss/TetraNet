@@ -29,9 +29,7 @@ def test_penalty_zero_at_wells():
 
 def test_penalty_positive_between_wells():
     """c between wells (midpoint 0.375) → penalty > 0."""
-    model = nn.ModuleList(
-        [QBitLinearQuaternary(4, 4, initial_c=0.375)]
-    )
+    model = nn.ModuleList([QBitLinearQuaternary(4, 4, initial_c=0.375)])
     penalty = multi_well_potential(model)
     # (0.375 - 0.25)^2 = 0.015625, (0.375 - 0.5)^2 = 0.015625, min = 0.015625
     assert penalty.item() == 0.015625, f"Expected 0.015625, got {penalty.item()}"
@@ -39,9 +37,7 @@ def test_penalty_positive_between_wells():
 
 def test_penalty_gradient_flow():
     """Backward through penalty produces non-zero gradients on c."""
-    model = nn.ModuleList(
-        [QBitLinearQuaternary(4, 4, initial_c=0.375)]
-    )
+    model = nn.ModuleList([QBitLinearQuaternary(4, 4, initial_c=0.375)])
     penalty = multi_well_potential(model)
     penalty.backward()
 
@@ -89,7 +85,11 @@ def test_scheduler_respects_alpha():
 def test_total_loss_end_to_end():
     """Full model: total loss = task_loss + lambda * penalty, gradients flow to c."""
     config = QuaternaryLlamaConfig(
-        vocab_size=1000, hidden_dim=64, num_layers=2, num_heads=2, max_seq_len=64,
+        vocab_size=1000,
+        hidden_dim=64,
+        num_layers=2,
+        num_heads=2,
+        max_seq_len=64,
     )
     model = QuaternaryLlamaForCausalLM(config)
     scheduler = AdaptiveSnappingScheduler(alpha=0.02, snap_start=0.9)
@@ -98,7 +98,9 @@ def test_total_loss_end_to_end():
     out = model(x, labels=x)
     task_loss = out["loss"]
 
-    total_loss = compute_total_loss(task_loss, model, progress=0.95, scheduler=scheduler)
+    total_loss = compute_total_loss(
+        task_loss, model, progress=0.95, scheduler=scheduler
+    )
 
     total_loss.backward()
 

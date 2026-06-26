@@ -1,6 +1,6 @@
 """
 Llama-style Decoder-only Transformer using QBitLinearQuaternary layers.
-~11M parameters at default config. Designed for TinyStories training.
+~9.4M parameters at default config (vocab_size=4096). Designed for TinyStories training.
 """
 
 import math
@@ -16,9 +16,9 @@ from quaternary import QBitLinearQuaternary
 
 @dataclass
 class QuaternaryLlamaConfig:
-    """Hyperparameters for the Quaternary Llama model (~11M params at defaults)."""
+    """Hyperparameters for the Quaternary Llama model (~9.4M params at defaults)."""
 
-    vocab_size: int = 10000
+    vocab_size: int = 4096
     hidden_dim: int = 256
     num_layers: int = 8
     num_heads: int = 8
