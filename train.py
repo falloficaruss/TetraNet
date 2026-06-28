@@ -31,21 +31,20 @@ class TinyStoriesDataset(Dataset):
 
 
 def preprocess(
+    data_path: str,
     tokenizer_path: str,
     output_path: str,
     num_stories: int = 10000,
 ):
-    from datasets import load_dataset
-
     tokenizer = Tokenizer.from_file(tokenizer_path)
-    dataset = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
 
     all_ids = []
-    for i, example in enumerate(dataset):
-        if i >= num_stories:
-            break
-        ids = tokenizer.encode(example["text"]).ids
-        all_ids.extend(ids)
+    with open(data_path, "r") as f:
+        for i, line in enumerate(f):
+            if i >= num_stories:
+                break
+            ids = tokenizer.encode(line.strip()).ids
+            all_ids.extend(ids)
 
     tokens = np.array(all_ids, dtype=np.uint16)
     np.save(output_path, tokens)
@@ -74,7 +73,7 @@ def train(args):
                 "Run `python train_tokenizer.py` first."
             )
         print("Pre-tokenizing TinyStories...")
-        preprocess(args.tokenizer_path, tokens_path, args.num_stories)
+        preprocess(args.data_path, args.tokenizer_path, tokens_path, args.num_stories)
 
     # ── Dataset ──
     dataset = TinyStoriesDataset(tokens_path, seq_len=args.seq_len)
@@ -214,6 +213,7 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--data-path", default="./tinystories/TinyStories-train.txt")
     parser.add_argument("--tokenizer-path", default="./tetranet_tokenizer.json")
     parser.add_argument("--tokens-path", default="./train_tokens.npy")
     parser.add_argument("--checkpoint-path", default="./model_final.pt")

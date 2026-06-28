@@ -1,12 +1,11 @@
-"""Train a custom Byte-Level BPE tokenizer (vocab_size=4096) on TinyStories."""
+"""Train a custom Byte-Level BPE tokenizer (vocab_size=4096) on TinyStories text file."""
 
 import argparse
 
 from tokenizers import Tokenizer, models, pre_tokenizers, trainers, processors
-from datasets import load_dataset
 
 
-def train_tokenizer(vocab_size: int, output_path: str, num_stories: int | None = None):
+def train_tokenizer(vocab_size: int, data_path: str, output_path: str):
     tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
 
@@ -16,15 +15,7 @@ def train_tokenizer(vocab_size: int, output_path: str, num_stories: int | None =
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
 
-    dataset = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
-
-    def get_training_corpus():
-        for i, example in enumerate(dataset):
-            if num_stories is not None and i >= num_stories:
-                break
-            yield example["text"]
-
-    tokenizer.train_from_iterator(get_training_corpus(), trainer)
+    tokenizer.train([data_path], trainer)
 
     tokenizer.post_processor = processors.TemplateProcessing(
         single="<s> $A </s>",
@@ -38,8 +29,7 @@ def train_tokenizer(vocab_size: int, output_path: str, num_stories: int | None =
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--vocab-size", type=int, default=4096)
+    parser.add_argument("--data-path", default="./tinystories/TinyStories-train.txt")
     parser.add_argument("--output", default="./tetranet_tokenizer.json")
-    parser.add_argument("--num-stories", type=int, default=None,
-                        help="Limit training stories (default: all 2.1M)")
     args = parser.parse_args()
-    train_tokenizer(args.vocab_size, args.output, args.num_stories)
+    train_tokenizer(args.vocab_size, args.data_path, args.output)
