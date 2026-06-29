@@ -4,7 +4,7 @@ Llama-style Decoder-only Transformer using QBitLinearQuaternary layers.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -29,6 +29,7 @@ class QuaternaryLlamaConfig:
     threshold: float = 1.0
     rms_norm_eps: float = 1e-6
     tie_weights: bool = True
+    linear_cls: type = QBitLinearQuaternary
 
     @property
     def head_dim(self) -> int:
@@ -105,21 +106,21 @@ class SwiGLUMLP(nn.Module):
 
     def __init__(self, config: QuaternaryLlamaConfig):
         super().__init__()
-        self.gate_proj = QBitLinearQuaternary(
+        self.gate_proj = config.linear_cls(
             config.hidden_dim,
             config.ffn_dim,
             bias=False,
             initial_c=config.initial_c,
             threshold=config.threshold,
         )
-        self.up_proj = QBitLinearQuaternary(
+        self.up_proj = config.linear_cls(
             config.hidden_dim,
             config.ffn_dim,
             bias=False,
             initial_c=config.initial_c,
             threshold=config.threshold,
         )
-        self.down_proj = QBitLinearQuaternary(
+        self.down_proj = config.linear_cls(
             config.ffn_dim,
             config.hidden_dim,
             bias=False,
@@ -140,28 +141,28 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.head_dim
         self.hidden_dim = config.hidden_dim
 
-        self.q_proj = QBitLinearQuaternary(
+        self.q_proj = config.linear_cls(
             config.hidden_dim,
             config.hidden_dim,
             bias=False,
             initial_c=config.initial_c,
             threshold=config.threshold,
         )
-        self.k_proj = QBitLinearQuaternary(
+        self.k_proj = config.linear_cls(
             config.hidden_dim,
             config.hidden_dim,
             bias=False,
             initial_c=config.initial_c,
             threshold=config.threshold,
         )
-        self.v_proj = QBitLinearQuaternary(
+        self.v_proj = config.linear_cls(
             config.hidden_dim,
             config.hidden_dim,
             bias=False,
             initial_c=config.initial_c,
             threshold=config.threshold,
         )
-        self.o_proj = QBitLinearQuaternary(
+        self.o_proj = config.linear_cls(
             config.hidden_dim,
             config.hidden_dim,
             bias=False,
@@ -326,11 +327,10 @@ class QuaternaryLlamaForCausalLM(nn.Module):
         return sum(p.numel() for p in set(self.parameters()))
 
     def get_c_values(self) -> dict[str, float]:
-        """Returns a dict mapping layer index -> c value for all decoder layers."""
+        """Returns a dict mapping projection -> c value for all layers.
+        Empty dict for baselines without learnable c parameters."""
         c_vals = {}
         for i, layer in enumerate(self.layers):
-            # Each layer has attention and MLP; all use the same initial_c but c is learnable per projection.
-            # Collect all unique c values from this layer. In practice they'll differ after training.
             for name, param in layer.named_parameters():
                 if name.endswith(".c"):
                     c_vals[f"layer.{i}.{name.replace('.c', '')}"] = param.item()
