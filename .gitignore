@@ -1,6 +1,5 @@
 __pycache__/
 tinystories/
-*.json
 findings/
 *.pt
 *.bin
