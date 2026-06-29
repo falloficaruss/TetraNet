@@ -30,13 +30,26 @@ class TinyStoriesDataset(Dataset):
         return chunk[:-1], chunk[1:]  # input_ids, labels
 
 
+def load_tokenizer(tokenizer_path: str) -> Tokenizer:
+    if not Path(tokenizer_path).exists():
+        raise FileNotFoundError(
+            f"Tokenizer not found at {tokenizer_path}. "
+            "Run `python train_tokenizer.py` first."
+        )
+    return Tokenizer.from_file(tokenizer_path)
+
+
+def get_vocab_size(tokenizer_path: str) -> int:
+    return load_tokenizer(tokenizer_path).get_vocab_size()
+
+
 def preprocess(
     data_path: str,
     tokenizer_path: str,
     output_path: str,
     num_stories: int = 10000,
 ):
-    tokenizer = Tokenizer.from_file(tokenizer_path)
+    tokenizer = load_tokenizer(tokenizer_path)
 
     all_ids = []
     with open(data_path, "r") as f:
@@ -47,7 +60,12 @@ def preprocess(
             all_ids.extend(ids)
 
     tokens = np.array(all_ids, dtype=np.uint16)
-    np.save(output_path, tokens)
+    max_id = int(tokens.max())
+    assert max_id < 4096, (
+        f"Token ID {max_id} exceeds vocab_size 4096. "
+        "Regenerate tokenizer with smaller vocab or increase model vocab_size."
+    )
+    tokens.tofile(output_path)  # raw binary, no header
     print(f"Pre-tokenized {num_stories} stories → {len(tokens):,} tokens → {output_path}")
 
 
@@ -67,11 +85,6 @@ def train(args):
     # ── Pre-tokenize if needed ──
     tokens_path = args.tokens_path
     if not Path(tokens_path).exists():
-        if not Path(args.tokenizer_path).exists():
-            raise FileNotFoundError(
-                f"Tokenizer not found at {args.tokenizer_path}. "
-                "Run `python train_tokenizer.py` first."
-            )
         print("Pre-tokenizing TinyStories...")
         preprocess(args.data_path, args.tokenizer_path, tokens_path, args.num_stories)
 
@@ -88,7 +101,7 @@ def train(args):
 
     # ── Model ──
     config = QuaternaryLlamaConfig(
-        vocab_size=4096,
+        vocab_size=get_vocab_size(args.tokenizer_path),
         hidden_dim=256,
         num_layers=8,
         num_heads=8,
@@ -103,8 +116,19 @@ def train(args):
     print(f"Model: {num_params:,} params")
 
     # ── Optimizer ──
+    # Separate learning rate for c parameters (higher to overcome AdamW normalization)
+    param_groups = [
+        {
+            "params": [p for n, p in model.named_parameters() if not n.endswith(".c")],
+            "lr": args.lr,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if n.endswith(".c")],
+            "lr": args.c_lr,
+        },
+    ]
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        param_groups,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -120,6 +144,7 @@ def train(args):
         "step", "progress", "task_loss", "total_loss",
         "lambda", "penalty", "lr",
         "n_snapped_025", "n_snapped_05",
+        "c_grad_mean", "c_grad_max",
     ])
 
     # ── Training loop ──
@@ -129,7 +154,7 @@ def train(args):
         [m for m in model.modules() if isinstance(m, QBitLinearQuaternary)]
     )
 
-    print(f"Starting training (alpha={args.alpha}, snap_start={args.snap_start})")
+    print(f"Starting training (alpha={args.alpha}, snap_start={args.snap_start}, c_lr={args.c_lr})")
     start_time = time.time()
 
     model.train()
@@ -167,6 +192,15 @@ def train(args):
                 snapped = count_snapped(c_vals)
                 elapsed = time.time() - start_time
 
+                # Log c gradient stats (only available before optimizer.step)
+                c_grads = [
+                    p.grad.item()
+                    for name, p in model.named_parameters()
+                    if name.endswith(".c") and p.grad is not None
+                ]
+                c_grad_mean = sum(c_grads) / len(c_grads) if c_grads else 0.0
+                c_grad_max = max(abs(g) for g in c_grads) if c_grads else 0.0
+
                 csv_writer.writerow([
                     step,
                     f"{progress:.4f}",
@@ -177,6 +211,8 @@ def train(args):
                     f"{args.lr:.2e}",
                     snapped[0.25],
                     snapped[0.5],
+                    f"{c_grad_mean:.4f}",
+                    f"{c_grad_max:.4f}",
                 ])
                 log_file.flush()
 
@@ -186,7 +222,8 @@ def train(args):
                     f"progress {progress:.3f} | "
                     f"loss {task_loss.item():.3f} | "
                     f"λ {lambda_val:.3f} | "
-                    f"snapped {snapped[0.25]}+{snapped[0.5]}/{num_snap_params}"
+                    f"snapped {snapped[0.25]}+{snapped[0.5]}/{num_snap_params} | "
+                    f"cg_mean {c_grad_mean:+.2f} cg_max {c_grad_max:.2f}"
                 )
 
     # ── Save checkpoint ──
@@ -215,7 +252,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", default="./tinystories/TinyStories-train.txt")
     parser.add_argument("--tokenizer-path", default="./tetranet_tokenizer.json")
-    parser.add_argument("--tokens-path", default="./train_tokens.npy")
+    parser.add_argument("--tokens-path", default="./train_tokens.bin")
     parser.add_argument("--checkpoint-path", default="./model_final.pt")
     parser.add_argument("--log-path", default="./training_log.csv")
     parser.add_argument("--num-stories", type=int, default=10000)
@@ -223,9 +260,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--c-lr", type=float, default=0.003,
+                        help="Learning rate for c parameters (higher to enable snapping)")
     parser.add_argument("--weight-decay", type=float, default=0.1)
-    parser.add_argument("--alpha", type=float, default=0.02)
-    parser.add_argument("--snap-start", type=float, default=0.9)
+    parser.add_argument("--alpha", type=float, default=2.0)
+    parser.add_argument("--snap-start", type=float, default=0.4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--log-interval", type=int, default=50)
     args = parser.parse_args()

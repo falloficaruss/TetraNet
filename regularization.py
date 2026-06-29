@@ -13,10 +13,10 @@ def multi_well_potential(
     total = torch.tensor(0.0, device=next(model.parameters()).device)
     for _name, module in model.named_modules():
         if isinstance(module, QBitLinearQuaternary):
-            distances = torch.stack([(module.c - w) ** 2 for w in wells])
+            distances = torch.stack([(module.c - w).abs() for w in wells])
             closest_idx = torch.argmin(distances).detach()
             closest_well = torch.as_tensor(wells[closest_idx], device=module.c.device)
-            total = total + (module.c - closest_well) ** 2
+            total = total + (module.c - closest_well).abs()
     return total
 
 

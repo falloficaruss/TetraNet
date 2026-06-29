@@ -119,12 +119,12 @@ def test_get_c_values():
 
 
 def test_get_num_params():
-    """Verify parameter count is in the expected range (~11M for default config)."""
+    """Verify parameter count is in the expected range (~9.4M for default config)."""
     model = QuaternaryLlamaForCausalLM()
     params = model.get_num_params()
-    # Expected: ~10,953,016
-    assert 10_000_000 < params < 12_000_000, f"Expected ~11M params, got {params:,}"
-    print(f"  ✓ {params:,} parameters (~11M expected)")
+    # Expected: ~9,441,592
+    assert 9_000_000 < params < 10_000_000, f"Expected ~9.4M params, got {params:,}"
+    print(f"  ✓ {params:,} parameters (~9.4M expected)")
 
 
 def test_weight_tying():

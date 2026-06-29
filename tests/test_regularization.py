@@ -31,8 +31,8 @@ def test_penalty_positive_between_wells():
     """c between wells (midpoint 0.375) → penalty > 0."""
     model = nn.ModuleList([QBitLinearQuaternary(4, 4, initial_c=0.375)])
     penalty = multi_well_potential(model)
-    # (0.375 - 0.25)^2 = 0.015625, (0.375 - 0.5)^2 = 0.015625, min = 0.015625
-    assert penalty.item() == 0.015625, f"Expected 0.015625, got {penalty.item()}"
+    # |0.375 - 0.25| = 0.125, |0.375 - 0.5| = 0.125, min = 0.125
+    assert penalty.item() == 0.125, f"Expected 0.125, got {penalty.item()}"
 
 
 def test_penalty_gradient_flow():
