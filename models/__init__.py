@@ -11,13 +11,15 @@ Usage:
 
 from model import QuaternaryLlamaForCausalLM, QuaternaryLlamaConfig
 from models.layers import FullPrecisionLinear, BitNetTernaryLinear, Uniform2BitLinear
-from quaternary import QBitLinearQuaternary
+from quaternary import FixedCQuaternaryLinear
 
 BASELINES = {
     "full_precision": FullPrecisionLinear,
     "bitnet": BitNetTernaryLinear,
     "uniform_2bit": Uniform2BitLinear,
-    "quaternary": QBitLinearQuaternary,
+    "fixed_c_025": FixedCQuaternaryLinear,
+    "fixed_c_05": FixedCQuaternaryLinear,
+    "fixed_c_075": FixedCQuaternaryLinear,
 }
 
 
@@ -38,6 +40,14 @@ def build_model(
         raise ValueError(f"Unknown baseline: {baseline}. Choose from {list(BASELINES.keys())}")
 
     linear_cls = BASELINES[baseline]
+
+    fixed_c_map = {
+        "fixed_c_025": 0.25,
+        "fixed_c_05": 0.5,
+        "fixed_c_075": 0.75,
+    }
+    if baseline in fixed_c_map:
+        initial_c = fixed_c_map[baseline]
 
     config = QuaternaryLlamaConfig(
         vocab_size=vocab_size,

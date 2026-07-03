@@ -1,17 +1,17 @@
 """
-Llama-style Decoder-only Transformer using QBitLinearQuaternary layers.
+Llama-style Decoder-only Transformer using FixedCQuaternaryLinear layers.
 ~9.4M parameters at default config (vocab_size=4096). Designed for TinyStories training.
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from quaternary import QBitLinearQuaternary
+from quaternary import FixedCQuaternaryLinear
 
 
 @dataclass
@@ -29,7 +29,7 @@ class QuaternaryLlamaConfig:
     threshold: float = 1.0
     rms_norm_eps: float = 1e-6
     tie_weights: bool = True
-    linear_cls: type = QBitLinearQuaternary
+    linear_cls: type = FixedCQuaternaryLinear
 
     @property
     def head_dim(self) -> int:

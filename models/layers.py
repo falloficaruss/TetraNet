@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Re-export for convenience
-from quaternary import QBitLinearQuaternary as QuaternaryLinear
+from quaternary import FixedCQuaternaryLinear as QuaternaryLinear
 
 
 class FullPrecisionLinear(nn.Linear):

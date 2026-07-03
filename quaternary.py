@@ -80,24 +80,22 @@ def quaternary_weight_quantize(weight, c, threshold=1.0):
     return quantized_weight
 
 
-class QBitLinearQuaternary(nn.Linear):
+
+class FixedCQuaternaryLinear(nn.Linear):
     """
-    A custom Linear layer that quantizes weights to the quaternary grid during the forward pass.
+    Quaternary Linear layer with FIXED c (register_buffer, not a Parameter).
+    c stays constant during training — useful as a controlled baseline.
     """
 
     def __init__(
         self, in_features, out_features, bias=False, initial_c=0.375, threshold=1.0
     ):
         super().__init__(in_features, out_features, bias=bias)
-        # Learnable floating-point parameter c for this layer
-        self.c = nn.Parameter(torch.tensor(initial_c))
+        self.register_buffer("c", torch.tensor(initial_c))
         self.threshold = threshold
 
     def forward(self, x):
-        # Quantize weights
         quantized_weight = quaternary_weight_quantize(
             self.weight, self.c, self.threshold
         )
-
-        # Standard linear projection using quantized weights
         return F.linear(x, quantized_weight, self.bias)

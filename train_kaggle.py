@@ -1,37 +1,200 @@
 """
 GPU training entry point for Kaggle Notebooks.
 
-Supports all 4 baselines, mixed precision, checkpoint resume (for Kaggle 9h limit),
-and auto-detects T4/P100/A100 GPU.
+Self-contained: no dependency on `models/` package (Kaggle Datasets don't support
+subdirectories). Only depends on model.py and quaternary.py.
+
+Supports all 4 baselines, mixed precision, checkpoint resume (for Kaggle 9h limit).
 
 Usage on Kaggle:
-    !python train_kaggle.py --baseline full_precision --epochs 1
+    !python train_kaggle.py --baseline fixed_c_05 --epochs 1
+    !python train_kaggle.py --baseline fixed_c_025 --epochs 1
+    !python train_kaggle.py --baseline fixed_c_075 --epochs 1
     !python train_kaggle.py --baseline bitnet --epochs 1
     !python train_kaggle.py --baseline uniform_2bit --epochs 1
-    !python train_kaggle.py --baseline quaternary --epochs 1
+    !python train_kaggle.py --baseline full_precision --epochs 1
 """
 
 import argparse
 import csv
-import json
 import os
-import shutil
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from models import build_model, BASELINES
-from regularization import AdaptiveSnappingScheduler, compute_total_loss, multi_well_potential
-from quaternary import QBitLinearQuaternary
+from model import QuaternaryLlamaForCausalLM, QuaternaryLlamaConfig
+from quaternary import FixedCQuaternaryLinear
 
 
-# ──────────────────────────────────────────────
-#  Dataset — memory-mapped token .bin file
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════
+#  4 Baseline Quantizer Layers
+# ══════════════════════════════════════════════════
+
+
+class FullPrecisionLinear(nn.Linear):
+    """Standard nn.Linear — no quantization.
+    Serves as the theoretical upper bound baseline."""
+
+    def __init__(self, in_features, out_features, bias=False, **kwargs):
+        super().__init__(in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        return F.linear(x, self.weight, self.bias)
+
+
+class BitNetTernaryFunction(torch.autograd.Function):
+    """STE backward for BitNet b1.58 ternary quantization."""
+
+    @staticmethod
+    def forward(ctx, x, threshold):
+        ctx.save_for_backward(x, threshold)
+        y = torch.sign(x)
+        y[x.abs() < 0.5] = 0.0
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, threshold = ctx.saved_tensors
+        grad_x = grad_output.clone()
+        grad_x[x.abs() > threshold] = 0.0
+        return grad_x, None
+
+
+class BitNetTernaryLinear(nn.Linear):
+    """BitNet b1.58-style ternary quantization to {-1, 0, 1} with STE."""
+
+    def __init__(self, in_features, out_features, bias=False, threshold=1.0, **kwargs):
+        super().__init__(in_features, out_features, bias=bias)
+        self.threshold = threshold
+
+    def _ternary_quantize(self, weight):
+        gamma = weight.abs().mean().clamp(min=1e-8).detach()
+        scaled = weight / gamma
+        quantized = BitNetTernaryFunction.apply(
+            scaled,
+            torch.tensor(self.threshold, device=weight.device, dtype=weight.dtype),
+        )
+        return quantized * gamma
+
+    def forward(self, x):
+        qweight = self._ternary_quantize(self.weight)
+        return F.linear(x, qweight, self.bias)
+
+
+class Uniform2BitFunction(torch.autograd.Function):
+    """STE backward for uniform 2-bit quantization to {-a, -a/3, a/3, a}."""
+
+    @staticmethod
+    def forward(ctx, x, threshold):
+        ctx.save_for_backward(x, threshold)
+        levels = torch.tensor(
+            [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0], device=x.device, dtype=x.dtype
+        )
+        flat = x.view(-1, 1)
+        dist = (flat - levels.unsqueeze(0)).abs()
+        indices = dist.argmin(dim=1)
+        y = levels[indices].view(x.shape)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, threshold = ctx.saved_tensors
+        grad_x = grad_output.clone()
+        grad_x[x.abs() > threshold] = 0.0
+        return grad_x, None
+
+
+class Uniform2BitLinear(nn.Linear):
+    """Uniform 2-bit quantization to 4 evenly-spaced levels with STE.
+
+    States: {-alpha, -alpha/3, alpha/3, alpha}
+    This is the naive 2-bit baseline that does NOT use power-of-two shifting.
+    """
+
+    def __init__(self, in_features, out_features, bias=False, threshold=1.0, **kwargs):
+        super().__init__(in_features, out_features, bias=bias)
+        self.threshold = threshold
+
+    def _uniform_quantize(self, weight):
+        gamma = weight.abs().max().clamp(min=1e-8).detach()
+        scaled = weight / gamma
+        quantized = Uniform2BitFunction.apply(
+            scaled,
+            torch.tensor(self.threshold, device=weight.device, dtype=weight.dtype),
+        )
+        return quantized * gamma
+
+    def forward(self, x):
+        qweight = self._uniform_quantize(self.weight)
+        return F.linear(x, qweight, self.bias)
+
+
+# ══════════════════════════════════════════════════
+#  Model Factory
+# ══════════════════════════════════════════════════
+
+BASELINES = {
+    "full_precision": FullPrecisionLinear,
+    "bitnet": BitNetTernaryLinear,
+    "uniform_2bit": Uniform2BitLinear,
+    "fixed_c_025": FixedCQuaternaryLinear,
+    "fixed_c_05": FixedCQuaternaryLinear,
+    "fixed_c_075": FixedCQuaternaryLinear,
+}
+
+
+def build_model(
+    baseline: str = "quaternary",
+    vocab_size: int = 4096,
+    hidden_dim: int = 768,
+    num_layers: int = 12,
+    num_heads: int = 12,
+    ffn_dim: int = 3072,
+    max_seq_len: int = 512,
+    initial_c: float = 0.375,
+    threshold: float = 1.0,
+    tie_weights: bool = True,
+    rope_base: float = 10000.0,
+) -> QuaternaryLlamaForCausalLM:
+    if baseline not in BASELINES:
+        raise ValueError(
+            f"Unknown baseline: {baseline}. Choose from {list(BASELINES.keys())}"
+        )
+
+    fixed_c_map = {
+        "fixed_c_025": 0.25,
+        "fixed_c_05": 0.5,
+        "fixed_c_075": 0.75,
+    }
+    if baseline in fixed_c_map:
+        initial_c = fixed_c_map[baseline]
+
+    config = QuaternaryLlamaConfig(
+        vocab_size=vocab_size,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        ffn_dim=ffn_dim,
+        max_seq_len=max_seq_len,
+        initial_c=initial_c,
+        threshold=threshold,
+        tie_weights=tie_weights,
+        rope_base=rope_base,
+        linear_cls=BASELINES[baseline],
+    )
+
+    return QuaternaryLlamaForCausalLM(config)
+
+
+# ══════════════════════════════════════════════════
+#  Dataset
+# ══════════════════════════════════════════════════
+
 
 class TinyStoriesDataset(Dataset):
     def __init__(self, tokens_path: str, seq_len: int = 512):
@@ -50,12 +213,14 @@ class TinyStoriesDataset(Dataset):
         return chunk[:-1], chunk[1:]
 
 
-# ──────────────────────────────────────────────
-#  Tokenizer loading
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════
+#  Tokenizer helpers
+# ══════════════════════════════════════════════════
+
 
 def load_tokenizer(tokenizer_path: str):
     from tokenizers import Tokenizer
+
     return Tokenizer.from_file(tokenizer_path)
 
 
@@ -69,7 +234,6 @@ def tokenize_dataset(
     output_path: str,
     max_stories: int = -1,
 ):
-    """Tokenize a text file of TinyStories into a raw binary .bin file."""
     if Path(output_path).exists():
         print(f"Found existing tokenized file: {output_path}")
         return
@@ -93,27 +257,16 @@ def tokenize_dataset(
         "Regenerate tokenizer with larger vocab."
     )
 
-    print(f"Tokenized {i+1 if max_stories < 0 else max_stories} stories "
-          f"→ {len(tokens):,} tokens → {output_path}")
+    print(
+        f"Tokenized {i+1 if max_stories < 0 else max_stories} stories "
+        f"\u2192 {len(tokens):,} tokens \u2192 {output_path}"
+    )
 
 
-# ──────────────────────────────────────────────
-#  Snapping helpers
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════
+#  Checkpoint
+# ══════════════════════════════════════════════════
 
-def count_snapped(c_values, wells=(0.25, 0.5), tol=0.01):
-    snapped = {w: 0 for w in wells}
-    for v in c_values.values():
-        for w in wells:
-            if abs(v - w) < tol:
-                snapped[w] += 1
-                break
-    return snapped
-
-
-# ──────────────────────────────────────────────
-#  Checkpoint resume
-# ──────────────────────────────────────────────
 
 def save_checkpoint(
     path: str,
@@ -137,7 +290,7 @@ def save_checkpoint(
         "args": vars(args),
     }
     torch.save(ckpt, path)
-    print(f"  Checkpoint saved → {path} (step {step})")
+    print(f"  Checkpoint saved \u2192 {path} (step {step})")
 
 
 def load_checkpoint(path: str, model, optimizer, scaler, device):
@@ -154,21 +307,26 @@ def load_checkpoint(path: str, model, optimizer, scaler, device):
     )
 
 
-# ──────────────────────────────────────────────
-#  Main training
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════
+#  Training
+# ══════════════════════════════════════════════════
+
 
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device} ({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})")
+    print(
+        f"Device: {device} "
+        f"({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})"
+    )
 
-    # ── Mixed precision ──
     use_amp = device.type == "cuda" and args.mixed_precision
-    amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
+    # Auto-detect BF16 support: requires CUDA capability >= 7.0 (Volta+)
+    cuda_cap = torch.cuda.get_device_capability(0) if device.type == "cuda" else (0, 0)
+    bf16_supported = cuda_cap >= (7, 0)
+    amp_dtype = torch.bfloat16 if (args.bf16 and bf16_supported) else torch.float16
     if use_amp:
-        print(f"Mixed precision: {amp_dtype}")
+        print(f"Mixed precision: {amp_dtype} (GPU cc {cuda_cap[0]}.{cuda_cap[1]})")
 
-    # ── Tokenize on first run ──
     if not Path(args.tokens_path).exists():
         print("Tokenizing TinyStories...")
         tokenize_dataset(
@@ -178,7 +336,6 @@ def train(args):
             args.max_stories,
         )
 
-    # ── Dataset ──
     dataset = TinyStoriesDataset(args.tokens_path, seq_len=args.seq_len)
     loader = DataLoader(
         dataset,
@@ -190,9 +347,11 @@ def train(args):
     )
     total_tokens = len(dataset) * args.seq_len
     total_steps = len(loader) * args.epochs
-    print(f"Dataset: {len(dataset):,} sequences ({total_tokens:,} tokens, {total_steps:,} steps)")
+    print(
+        f"Dataset: {len(dataset):,} sequences "
+        f"({total_tokens:,} tokens, {total_steps:,} steps)"
+    )
 
-    # ── Model ──
     vocab_size = get_vocab_size(args.tokenizer_path)
     model = build_model(
         baseline=args.baseline,
@@ -209,44 +368,17 @@ def train(args):
     num_params = model.get_num_params()
     print(f"Model: {num_params:,} params")
 
-    # ── Optimizer ──
-    has_c_params = args.baseline == "quaternary"
-    if has_c_params:
-        param_groups = [
-            {
-                "params": [p for n, p in model.named_parameters() if not n.endswith(".c")],
-                "lr": args.lr,
-            },
-            {
-                "params": [p for n, p in model.named_parameters() if n.endswith(".c")],
-                "lr": args.c_lr,
-            },
-        ]
-    else:
-        param_groups = [
-            {
-                "params": model.parameters(),
-                "lr": args.lr,
-            }
-        ]
-
     optimizer = torch.optim.AdamW(
-        param_groups,
+        model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
         betas=(args.beta1, args.beta2),
     )
 
-    # Gradient scaler for FP16 (not needed for BF16)
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
-
-    # Snapping scheduler (Quaternary only)
-    snap_scheduler = AdaptiveSnappingScheduler(
-        alpha=args.alpha,
-        snap_start=args.snap_start,
+    scaler = torch.amp.GradScaler(
+        device.type, enabled=(use_amp and amp_dtype == torch.float16)
     )
 
-    # ── Checkpoint resume ──
     start_step = 0
     tokens_seen = 0
     start_epoch = 0
@@ -257,28 +389,29 @@ def train(args):
         start_step, tokens_seen, start_epoch, best_loss = load_checkpoint(
             args.checkpoint_path, model, optimizer, scaler, device
         )
-        print(f"  Resumed at step {start_step}, epoch {start_epoch}, tokens_seen {tokens_seen:,}")
+        print(
+            f"  Resumed at step {start_step}, "
+            f"epoch {start_epoch}, tokens_seen {tokens_seen:,}"
+        )
 
-    # ── CSV logging ──
     log_path = args.log_path
     write_header = not Path(log_path).exists()
     log_file = open(log_path, "a", newline="")
     csv_writer = csv.writer(log_file)
     if write_header:
         csv_writer.writerow([
-            "step", "epoch", "progress", "task_loss", "total_loss",
-            "lambda", "penalty", "lr", "grad_norm",
-            "n_snapped_025", "n_snapped_05",
-            "c_grad_mean", "c_grad_max",
+            "step",
+            "epoch",
+            "progress",
+            "task_loss",
+            "lr",
+            "grad_norm",
         ])
 
-    # ── Training loop ──
-    num_snap_params = len(
-        [m for m in model.modules() if isinstance(m, QBitLinearQuaternary)]
-    ) if has_c_params else 0
-
-    print(f"Starting {args.baseline} training "
-          f"(lr={args.lr}, batch={args.batch_size}, epochs={args.epochs})")
+    print(
+        f"Starting {args.baseline} training "
+        f"(lr={args.lr}, batch={args.batch_size}, epochs={args.epochs})"
+    )
     start_time = time.time()
 
     model.train()
@@ -294,27 +427,16 @@ def train(args):
             input_ids = input_ids.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            # ── Forward ──
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            with torch.autocast(
+                device_type=device.type, dtype=amp_dtype, enabled=use_amp
+            ):
                 out = model(input_ids, labels=labels)
                 task_loss = out["loss"]
 
-                if has_c_params and progress > args.snap_start:
-                    total_loss = compute_total_loss(
-                        task_loss, model, progress, snap_scheduler
-                    )
-                    penalty = multi_well_potential(model).detach().item()
-                    lambda_val = snap_scheduler.get_lambda(progress, task_loss.detach())
-                else:
-                    total_loss = task_loss
-                    penalty = 0.0
-                    lambda_val = 0.0
-
-            # ── Backward ──
             if use_amp and amp_dtype == torch.float16:
-                scaler.scale(total_loss).backward()
+                scaler.scale(task_loss).backward()
             else:
-                total_loss.backward()
+                task_loss.backward()
 
             if (batch_idx + 1) % args.grad_accum == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -334,47 +456,30 @@ def train(args):
             epoch_loss += task_loss.item()
             epoch_steps += 1
 
-            # ── Logging ──
             if step % args.log_interval == 0:
-                c_vals = model.get_c_values()
-                snapped = count_snapped(c_vals) if has_c_params else {}
                 elapsed = time.time() - start_time
-
-                c_grads = [
-                    p.grad.item()
-                    for n, p in model.named_parameters()
-                    if n.endswith(".c") and p.grad is not None
-                ]
-                c_grad_mean = sum(c_grads) / len(c_grads) if c_grads else 0.0
-                c_grad_max = max(abs(g) for g in c_grads) if c_grads else 0.0
 
                 csv_writer.writerow([
                     step,
                     epoch,
                     f"{progress:.4f}",
                     f"{task_loss.item():.4f}",
-                    f"{total_loss.item():.4f}",
-                    f"{lambda_val:.4f}",
-                    f"{penalty:.6f}",
                     f"{optimizer.param_groups[0]['lr']:.2e}",
                     f"{grad_norm.item():.4f}",
-                    snapped.get(0.25, 0),
-                    snapped.get(0.5, 0),
-                    f"{c_grad_mean:.4f}",
-                    f"{c_grad_max:.4f}",
                 ])
                 log_file.flush()
 
-                # Track best loss
                 if task_loss.item() < best_loss:
                     best_loss = task_loss.item()
 
                 speed = tokens_seen / elapsed
-                eta_sec = (total_tokens * args.epochs - tokens_seen) / speed if speed > 0 else 0
+                eta_sec = (
+                    (total_tokens * args.epochs - tokens_seen) / speed
+                    if speed > 0
+                    else 0
+                )
                 eta_h = eta_sec / 3600
 
-                snap_info = (f"| λ {lambda_val:.3f} | snapped {snapped.get(0.25, 0)}+{snapped.get(0.5, 0)}/{num_snap_params}"
-                             if has_c_params else "")
                 print(
                     f"[{args.baseline[:4]}] "
                     f"step {step:>7} | "
@@ -384,65 +489,75 @@ def train(args):
                     f"loss {task_loss.item():.3f} | "
                     f"tok/s {speed:,.0f} | "
                     f"ETA {eta_h:.1f}h"
-                    f"{snap_info}"
                 )
 
-            # ── Periodic checkpoint ──
             if step > 0 and step % args.ckpt_interval == 0:
                 save_checkpoint(
                     args.checkpoint_path,
-                    model, optimizer, scaler,
-                    step, tokens_seen, epoch, best_loss, args,
+                    model,
+                    optimizer,
+                    scaler,
+                    step,
+                    tokens_seen,
+                    epoch,
+                    best_loss,
+                    args,
                 )
 
-        # End of epoch checkpoint
         save_checkpoint(
             args.checkpoint_path,
-            model, optimizer, scaler,
-            step, tokens_seen, epoch, best_loss, args,
+            model,
+            optimizer,
+            scaler,
+            step,
+            tokens_seen,
+            epoch,
+            best_loss,
+            args,
         )
         avg_loss = epoch_loss / max(epoch_steps, 1)
-        print(f"  Epoch {epoch} complete — avg loss {avg_loss:.4f}")
+        print(f"  Epoch {epoch} complete \u2014 avg loss {avg_loss:.4f}")
 
-    # ── Final save ──
     save_checkpoint(
         args.checkpoint_path.replace(".pt", "_final.pt"),
-        model, optimizer, scaler,
-        step, tokens_seen, args.epochs - 1, best_loss, args,
+        model,
+        optimizer,
+        scaler,
+        step,
+        tokens_seen,
+        args.epochs - 1,
+        best_loss,
+        args,
     )
-
-    # ── Final c report ──
-    if has_c_params:
-        c_vals = model.get_c_values()
-        snapped = count_snapped(c_vals)
-        print(f"\nFinal c: {snapped[0.25]} at 0.25, {snapped[0.5]} at 0.5")
-        for name, val in sorted(c_vals.items()):
-            print(f"  {name}: {val:.4f}")
 
     log_file.close()
     print(f"\nDone! Best loss: {best_loss:.4f}")
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════
 #  CLI
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Tetranet — Kaggle GPU training")
+    parser = argparse.ArgumentParser(description="Tetranet \u2014 Kaggle GPU training")
 
-    # Baseline
-    parser.add_argument("--baseline", default="quaternary",
-                        choices=list(BASELINES.keys()),
-                        help="Which baseline to train")
+    parser.add_argument(
+        "--baseline",
+        default="fixed_c_05",
+        choices=list(BASELINES.keys()),
+        help="Which baseline to train",
+    )
 
-    # Data
-    parser.add_argument("--data-path", default="/kaggle/input/tinystories/TinyStories-train.txt")
+    parser.add_argument(
+        "--data-path",
+        default="/kaggle/input/tinystories/TinyStories-train.txt",
+    )
     parser.add_argument("--tokenizer-path", default="./tetranet_tokenizer.json")
     parser.add_argument("--tokens-path", default="./train_tokens.bin")
-    parser.add_argument("--max-stories", type=int, default=-1,
-                        help="Limit stories for tokenization (-1 = all)")
+    parser.add_argument(
+        "--max-stories", type=int, default=500000, help="Limit stories (-1 = all, default 500K)"
+    )
 
-    # Architecture
     parser.add_argument("--hidden-dim", type=int, default=768)
     parser.add_argument("--num-layers", type=int, default=12)
     parser.add_argument("--num-heads", type=int, default=12)
@@ -452,36 +567,39 @@ if __name__ == "__main__":
     parser.add_argument("--initial-c", type=float, default=0.375)
     parser.add_argument("--threshold", type=float, default=1.0)
 
-    # Training
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--c-lr", type=float, default=0.003)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--grad-clip", type=float, default=1.0)
 
-    # Snapping (Quaternary only)
-    parser.add_argument("--alpha", type=float, default=2.0)
-    parser.add_argument("--snap-start", type=float, default=0.4)
-
-    # Mixed precision
     parser.add_argument("--mixed-precision", action="store_true", default=True)
     parser.add_argument("--no-mixed-precision", action="store_false", dest="mixed_precision")
-    parser.add_argument("--bf16", action="store_true", default=False,
-                        help="Use BF16 instead of FP16 (preferred on Ampere+)")
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        default=False,
+        help="Use BF16 instead of FP16 (preferred on Ampere+)",
+    )
 
-    # Checkpoint / resume
     parser.add_argument("--checkpoint-path", default="./model_checkpoint.pt")
     parser.add_argument("--log-path", default="./training_log.csv")
-    parser.add_argument("--resume", action="store_true", default=True,
-                        help="Resume from checkpoint if exists")
-    parser.add_argument("--ckpt-interval", type=int, default=5000,
-                        help="Save checkpoint every N steps")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=True,
+        help="Resume from checkpoint if exists",
+    )
+    parser.add_argument(
+        "--ckpt-interval",
+        type=int,
+        default=5000,
+        help="Save checkpoint every N steps",
+    )
 
-    # Performance
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--log-interval", type=int, default=100)
 
