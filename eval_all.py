@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from tokenizers import Tokenizer
 from torch.utils.data import DataLoader, Dataset
 
-from models import build_model
+from train_kaggle import build_model
 
 SEQ_LEN = 512
 BATCH_SIZE = 4
@@ -86,7 +86,9 @@ def main():
         description="Evaluate all baselines on TinyStories-valid"
     )
     parser.add_argument("--tokenizer", default="tetranet_tokenizer.json")
-    parser.add_argument("--valid-data", default="tinystories/TinyStoriesV2-GPT4-valid.txt")
+    parser.add_argument(
+        "--valid-data", default="tinystories/TinyStoriesV2-GPT4-valid.txt"
+    )
     parser.add_argument("--max-stories", type=int, default=MAX_STORIES)
     parser.add_argument(
         "--baselines",
@@ -131,8 +133,10 @@ def main():
                     snapped["0.50"] += 1
             total = sum(snapped.values())
             if total > 0:
-                print(f"  snapped → 0.25: {snapped['0.25']}/{total}  "
-                      f"0.50: {snapped['0.50']}/{total}")
+                print(
+                    f"  snapped → 0.25: {snapped['0.25']}/{total}  "
+                    f"0.50: {snapped['0.50']}/{total}"
+                )
         print()
 
     # Summary table
