@@ -28,7 +28,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from model import QuaternaryLlamaForCausalLM, QuaternaryLlamaConfig
-from quaternary import FixedCQuaternaryLinear
+from quaternary import FixedCQuaternaryLinear, LearnedCQuaternaryLinear
+from regularization import AdaptiveSnappingScheduler, compute_total_loss, multi_well_potential
 
 
 # ══════════════════════════════════════════════════
@@ -145,6 +146,7 @@ BASELINES = {
     "fixed_c_025": FixedCQuaternaryLinear,
     "fixed_c_05": FixedCQuaternaryLinear,
     "fixed_c_075": FixedCQuaternaryLinear,
+    "learned_c": LearnedCQuaternaryLinear,
 }
 
 
@@ -189,6 +191,21 @@ def build_model(
     )
 
     return QuaternaryLlamaForCausalLM(config)
+
+
+# ══════════════════════════════════════════════════
+#  Snapping helpers
+# ══════════════════════════════════════════════════
+
+
+def count_snapped(c_values: dict[str, float], wells=(0.25, 0.5), tol=0.01):
+    snapped = {w: 0 for w in wells}
+    for v in c_values.values():
+        for w in wells:
+            if abs(v - w) < tol:
+                snapped[w] += 1
+                break
+    return snapped
 
 
 # ══════════════════════════════════════════════════
@@ -368,12 +385,36 @@ def train(args):
     num_params = model.get_num_params()
     print(f"Model: {num_params:,} params")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(args.beta1, args.beta2),
-    )
+    has_snap = args.baseline == "learned_c"
+
+    if has_snap:
+        param_groups = [
+            {
+                "params": [p for n, p in model.named_parameters() if not n.endswith(".c")],
+                "lr": args.lr,
+            },
+            {
+                "params": [p for n, p in model.named_parameters() if n.endswith(".c")],
+                "lr": args.c_lr,
+            },
+        ]
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(args.beta1, args.beta2),
+        )
+        snap_scheduler = AdaptiveSnappingScheduler(
+            alpha=args.alpha, snap_start=args.snap_start
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(args.beta1, args.beta2),
+        )
+        snap_scheduler = None
 
     scaler = torch.amp.GradScaler(
         device.type, enabled=(use_amp and amp_dtype == torch.float16)
@@ -399,14 +440,17 @@ def train(args):
     log_file = open(log_path, "a", newline="")
     csv_writer = csv.writer(log_file)
     if write_header:
-        csv_writer.writerow([
+        cols = [
             "step",
             "epoch",
             "progress",
             "task_loss",
             "lr",
             "grad_norm",
-        ])
+        ]
+        if has_snap:
+            cols += ["total_loss", "lambda", "penalty", "n_snapped_025", "n_snapped_05"]
+        csv_writer.writerow(cols)
 
     print(
         f"Starting {args.baseline} training "
@@ -433,10 +477,23 @@ def train(args):
                 out = model(input_ids, labels=labels)
                 task_loss = out["loss"]
 
-            if use_amp and amp_dtype == torch.float16:
-                scaler.scale(task_loss).backward()
+            if has_snap and progress > args.snap_start:
+                total_loss = compute_total_loss(
+                    task_loss, model, progress, snap_scheduler
+                )
+                penalty = multi_well_potential(model).detach().item()
+                lambda_val = snap_scheduler.get_lambda(
+                    progress, task_loss.detach()
+                )
             else:
-                task_loss.backward()
+                total_loss = task_loss
+                penalty = 0.0
+                lambda_val = 0.0
+
+            if use_amp and amp_dtype == torch.float16:
+                scaler.scale(total_loss).backward()
+            else:
+                total_loss.backward()
 
             if (batch_idx + 1) % args.grad_accum == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -459,14 +516,24 @@ def train(args):
             if step % args.log_interval == 0:
                 elapsed = time.time() - start_time
 
-                csv_writer.writerow([
+                row = [
                     step,
                     epoch,
                     f"{progress:.4f}",
                     f"{task_loss.item():.4f}",
                     f"{optimizer.param_groups[0]['lr']:.2e}",
                     f"{grad_norm.item():.4f}",
-                ])
+                ]
+                if has_snap:
+                    snapped = count_snapped(model.get_c_values())
+                    row += [
+                        f"{total_loss.item():.4f}",
+                        f"{lambda_val:.4f}",
+                        f"{penalty:.4f}",
+                        snapped[0.25],
+                        snapped[0.5],
+                    ]
+                csv_writer.writerow(row)
                 log_file.flush()
 
                 if task_loss.item() < best_loss:
@@ -594,10 +661,29 @@ if __name__ == "__main__":
         help="Resume from checkpoint if exists",
     )
     parser.add_argument(
-        "--ckpt-interval",
+        "--log-interval",
         type=int,
-        default=5000,
-        help="Save checkpoint every N steps",
+        default=100,
+    )
+
+    # ── Snapping args (only used with --baseline learned_c) ──
+    parser.add_argument(
+        "--c-lr",
+        type=float,
+        default=0.003,
+        help="Learning rate for c parameters (learned_c only)",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=2.0,
+        help="Snapping penalty strength (learned_c only)",
+    )
+    parser.add_argument(
+        "--snap-start",
+        type=float,
+        default=0.4,
+        help="Progress threshold to activate snapping penalty (0-1, learned_c only)",
     )
 
     parser.add_argument("--num-workers", type=int, default=2)

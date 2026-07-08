@@ -1,19 +1,21 @@
 """
-Benchmark compute cost of all baselines: MAC counting, energy estimation, GPU throughput.
+Benchmark compute cost of all baselines: MAC counting, energy estimation, CPU/GPU throughput.
 
 Usage:
-    python benchmark.py                          # run all baselines
-    python benchmark.py --baselines bitnet fixed_c_05  # subset
-    python benchmark.py --no-gpu                 # skip GPU throughput (theoretical only)
+    python benchmark.py                                    # all baselines, single-thread CPU
+    python benchmark.py --baselines bitnet fixed_c_05       # subset
+    python benchmark.py --threads 0                         # all CPU cores (peak throughput)
+    python benchmark.py --iterations 10                     # quick run (fewer iterations)
 
-Output: clean markdown table comparing full_precision, bitnet, fixed_c_05, fixed_c_025.
+Output: clean table comparing full_precision, bitnet, fixed_c_05, fixed_c_025.
 """
 import argparse
+import os
 import time
 
 import torch
 
-from train_kaggle import build_model, QuaternaryLlamaConfig
+from train_kaggle import build_model
 
 DEFAULT_CONFIG = dict(
     vocab_size=4096,
@@ -129,7 +131,7 @@ def benchmark_throughput(
     n_iter: int = 100,
     device: str = "cpu",
 ):
-    """Measure tok/s for a single model on random inputs."""
+    """Measure tok/s for a single model on random inputs. Works on CPU and GPU."""
     model = model.to(device)
     model.eval()
 
@@ -140,33 +142,23 @@ def benchmark_throughput(
         with torch.no_grad():
             model(input_ids)
 
-    # Benchmark
-    if device == "cuda":
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        for _ in range(n_iter):
-            with torch.no_grad():
-                model(input_ids)
-        end_event.record()
+    if torch.cuda.is_available():
         torch.cuda.synchronize()
-        elapsed_ms = start_event.elapsed_time(end_event)
-    else:
-        torch.set_num_threads(1)
-        start = time.perf_counter()
-        for _ in range(n_iter):
-            with torch.no_grad():
-                model(input_ids)
-        elapsed = time.perf_counter() - start
-        elapsed_ms = elapsed * 1000
+    start = time.perf_counter()
+    for _ in range(n_iter):
+        with torch.no_grad():
+            model(input_ids)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
 
-    total_forward = elapsed_ms / n_iter  # ms per forward
-    tokens_per_sec = batch_size * seq_len / (total_forward / 1000)
-    return tokens_per_sec, total_forward
+    elapsed_ms = elapsed * 1000 / n_iter  # ms per forward
+    tokens_per_sec = batch_size * seq_len / (elapsed_ms / 1000)
+    return tokens_per_sec, elapsed_ms
 
 
-def print_throughput_table(results: dict, baselines: list[str], batch_sizes: list[int]):
-    print("─── GPU throughput (synthetic random inputs) ───")
+def print_throughput_table(results: dict, baselines: list[str], batch_sizes: list[int], device: str):
+    print(f"─── Throughput on {device} (synthetic random inputs) ───")
     header = f"  {'Baseline':<20s}"
     for bs in batch_sizes:
         header += f" {'tok/s (bs=' + str(bs) + ')':>18s}"
@@ -201,7 +193,14 @@ def main():
         default=[1, 8, 64],
         help="Batch sizes for throughput test",
     )
-    parser.add_argument("--no-gpu", action="store_true", help="Skip GPU benchmark")
+    parser.add_argument(
+        "--threads", type=int, default=1,
+        help="CPU threads (0 = all cores). Single-thread for edge-CPU latency.",
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=100,
+        help="Forward passes per benchmark (lower = faster, noisier)",
+    )
     parser.add_argument(
         "--hidden-dim", type=int, default=DEFAULT_CONFIG["hidden_dim"]
     )
@@ -225,62 +224,63 @@ def main():
         tie_weights=True,
     )
 
-    device = "cuda" if torch.cuda.is_available() and not args.no_gpu else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Thread control for CPU
+    n_threads = args.threads if args.threads > 0 else (os.cpu_count() or 1)
+    if device == "cpu":
+        torch.set_num_threads(n_threads)
+    thread_info = f" ({n_threads} thread{'s' if n_threads > 1 else ''})" if device == "cpu" else ""
 
     macs = count_macs_per_token(cfg)
 
     print(f"Model: hidden_dim={cfg['hidden_dim']}, num_layers={cfg['num_layers']}, "
           f"ffn_dim={cfg['ffn_dim']}, seq_len={cfg['max_seq_len']}")
-    print(f"Device: {device}")
+    print(f"Device: {device}{thread_info}")
     print()
 
     print_mac_table(macs)
     print_energy_table(macs["total_macs"], args.baselines)
 
+    print("─── Building models for throughput benchmark ───")
     throughput_results = {}
-    if device == "cuda":
-        print("─── Building models for throughput benchmark ───")
-        for name in args.baselines:
-            print(f"\r  Building {name}...", end="", flush=True)
-            model = build_model(
-                baseline=name,
-                vocab_size=cfg["vocab_size"],
-                hidden_dim=cfg["hidden_dim"],
-                num_layers=cfg["num_layers"],
-                num_heads=cfg["num_heads"],
-                ffn_dim=cfg["ffn_dim"],
-                max_seq_len=cfg["max_seq_len"],
-                tie_weights=True,
+    for name in args.baselines:
+        print(f"  Building {name}...", flush=True)
+        model = build_model(
+            baseline=name,
+            vocab_size=cfg["vocab_size"],
+            hidden_dim=cfg["hidden_dim"],
+            num_layers=cfg["num_layers"],
+            num_heads=cfg["num_heads"],
+            ffn_dim=cfg["ffn_dim"],
+            max_seq_len=cfg["max_seq_len"],
+            tie_weights=True,
+        )
+        throughput_results[name] = {}
+        for bs in args.batch_sizes:
+            tok_s, ms = benchmark_throughput(
+                model, bs, cfg["max_seq_len"], cfg["vocab_size"],
+                n_iter=args.iterations,
+                device=device,
             )
-            throughput_results[name] = {}
-            for bs in args.batch_sizes:
-                tok_s, ms = benchmark_throughput(
-                    model, bs, cfg["max_seq_len"], cfg["vocab_size"],
-                    device=device,
-                )
-                throughput_results[name][bs] = (tok_s, ms)
-        print("\r" + " " * 50 + "\r", end="")
-        print_throughput_table(throughput_results, args.baselines, args.batch_sizes)
+            throughput_results[name][bs] = (tok_s, ms)
+    print()
+    print_throughput_table(throughput_results, args.baselines, args.batch_sizes, device)
 
     # ── Summary table ──
     print("=" * 80)
     print(f"{'SUMMARY':^80s}")
     print("=" * 80)
-    header = f"  {'Baseline':<20s} {'MACs/tok':<12s} {'Quant op':<32s} {'pJ/MAC':<10s} {'nJ/tok':<10s}"
-    if device == "cuda":
-        header += f" {'tok/s(bs=1)':>14s}"
+    header = f"  {'Baseline':<20s} {'MACs/tok':<12s} {'Quant op':<32s} {'pJ/MAC':<10s} {'nJ/tok':<10s} {'tok/s(bs=1)':>14s}"
     print(header)
-    print(f"  {'─'*20} {'─'*12} {'─'*32} {'─'*10} {'─'*10}"
-          + (f" {'─'*14}" if device == "cuda" else ""))
+    print(f"  {'─'*20} {'─'*12} {'─'*32} {'─'*10} {'─'*10} {'─'*14}")
     for name in args.baselines:
         total_macs = macs["total_macs"]
         pj_per_mac = QUANT_ENERGY[name]
         nJ = total_macs * pj_per_mac / 1000
+        tok_s, _ = throughput_results[name][1]
         row = (f"  {name:<20s} {total_macs:<12,} {baseline_quant_type(name):<32s}"
-               f" {pj_per_mac:<10.1f} {nJ:<10.1f}")
-        if device == "cuda" and name in throughput_results:
-            tok_s, _ = throughput_results[name][1]
-            row += f" {tok_s:>14,.0f}"
+               f" {pj_per_mac:<10.1f} {nJ:<10.1f} {tok_s:>14,.0f}")
         print(row)
     print("=" * 80)
 

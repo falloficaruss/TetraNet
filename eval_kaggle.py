@@ -5,6 +5,7 @@ Reuses build_model/BASELINES from train_kaggle.py.
 Usage on Kaggle:
     !python eval_kaggle.py --baseline fixed_c_05 --ckpt ./model_checkpoint_final.pt
 """
+
 import argparse
 from pathlib import Path
 
@@ -74,11 +75,15 @@ def infer_config_from_ckpt(ckpt_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate trained model on validation set")
-    parser.add_argument("--baseline", default="fixed_c_05")
-    parser.add_argument("--ckpt", default="./model_checkpoint_final.pt")
+    parser = argparse.ArgumentParser(
+        description="Evaluate trained model on validation set"
+    )
+    parser.add_argument("--baseline", default="bitnet")
+    parser.add_argument("--ckpt", default="./checkpoint_final_bitnet.pt")
     parser.add_argument("--tokenizer", default="./tetranet_tokenizer.json")
-    parser.add_argument("--valid-data", default="/kaggle/input/tinystories/TinyStoriesV2-GPT4-valid.txt")
+    parser.add_argument(
+        "--valid-data", default="./tinystories/TinyStoriesV2-GPT4-valid.txt"
+    )
     parser.add_argument("--max-stories", type=int, default=2500)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=512)
@@ -93,7 +98,9 @@ def main():
     tokenizer = load_tokenizer(args.tokenizer)
     tokens = tokenize_valid(args.valid_data, tokenizer, args.max_stories)
     dataset = ValidDataset(tokens, args.seq_len)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=False, drop_last=False
+    )
     print(f"Validation sequences: {len(dataset):,}")
 
     print("Building model...", flush=True)

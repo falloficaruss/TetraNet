@@ -10,8 +10,12 @@ Usage:
 """
 
 from model import QuaternaryLlamaForCausalLM, QuaternaryLlamaConfig
-from models.layers import FullPrecisionLinear, BitNetTernaryLinear, Uniform2BitLinear
-from quaternary import FixedCQuaternaryLinear
+from models.layers import (
+    FullPrecisionLinear,
+    BitNetTernaryLinear,
+    Uniform2BitLinear,
+)
+from quaternary import FixedCQuaternaryLinear, LearnedCQuaternaryLinear
 
 BASELINES = {
     "full_precision": FullPrecisionLinear,
@@ -20,6 +24,7 @@ BASELINES = {
     "fixed_c_025": FixedCQuaternaryLinear,
     "fixed_c_05": FixedCQuaternaryLinear,
     "fixed_c_075": FixedCQuaternaryLinear,
+    "learned_c": LearnedCQuaternaryLinear,
 }
 
 

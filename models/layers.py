@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 # Re-export for convenience
 from quaternary import FixedCQuaternaryLinear as QuaternaryLinear
+from quaternary import LearnedCQuaternaryLinear
 
 
 class FullPrecisionLinear(nn.Linear):

@@ -99,3 +99,24 @@ class FixedCQuaternaryLinear(nn.Linear):
             self.weight, self.c, self.threshold
         )
         return F.linear(x, quantized_weight, self.bias)
+
+
+class LearnedCQuaternaryLinear(nn.Linear):
+    """
+    Quaternary Linear layer with LEARNABLE c (nn.Parameter, not a buffer).
+    c starts at initial_c and receives gradients during training.
+    Used for the two-stage snapping methodology (Phase 1: exploration, Phase 2: snap).
+    """
+
+    def __init__(
+        self, in_features, out_features, bias=False, initial_c=0.375, threshold=1.0
+    ):
+        super().__init__(in_features, out_features, bias=bias)
+        self.c = nn.Parameter(torch.tensor(initial_c))
+        self.threshold = threshold
+
+    def forward(self, x):
+        quantized_weight = quaternary_weight_quantize(
+            self.weight, self.c, self.threshold
+        )
+        return F.linear(x, quantized_weight, self.bias)
