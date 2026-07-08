@@ -17,6 +17,7 @@ Usage on Kaggle:
 
 import argparse
 import csv
+import json
 import os
 import time
 from pathlib import Path
@@ -449,7 +450,7 @@ def train(args):
             "grad_norm",
         ]
         if has_snap:
-            cols += ["total_loss", "lambda", "penalty", "n_snapped_025", "n_snapped_05"]
+            cols += ["total_loss", "lambda", "penalty", "n_snapped_025", "n_snapped_05", "c_values_json"]
         csv_writer.writerow(cols)
 
     print(
@@ -525,13 +526,15 @@ def train(args):
                     f"{grad_norm.item():.4f}",
                 ]
                 if has_snap:
-                    snapped = count_snapped(model.get_c_values())
+                    c_vals = model.get_c_values()
+                    snapped = count_snapped(c_vals)
                     row += [
                         f"{total_loss.item():.4f}",
                         f"{lambda_val:.4f}",
                         f"{penalty:.4f}",
                         snapped[0.25],
                         snapped[0.5],
+                        json.dumps(c_vals),
                     ]
                 csv_writer.writerow(row)
                 log_file.flush()
