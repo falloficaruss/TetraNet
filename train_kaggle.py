@@ -689,6 +689,12 @@ if __name__ == "__main__":
         help="Progress threshold to activate snapping penalty (0-1, learned_c only)",
     )
 
+    parser.add_argument(
+        "--ckpt-interval",
+        type=int,
+        default=5000,
+        help="Save checkpoint every N steps",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
 
     args = parser.parse_args()
