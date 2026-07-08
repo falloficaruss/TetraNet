@@ -690,7 +690,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--log-interval", type=int, default=100)
 
     args = parser.parse_args()
     train(args)
