@@ -88,7 +88,8 @@ class FixedCQuaternaryLinear(nn.Linear):
     """
 
     def __init__(
-        self, in_features, out_features, bias=False, initial_c=0.375, threshold=1.0
+        self, in_features, out_features, bias=False, initial_c=0.375,
+        threshold=1.0, **kwargs
     ):
         super().__init__(in_features, out_features, bias=bias)
         self.register_buffer("c", torch.tensor(initial_c))
@@ -109,10 +110,41 @@ class LearnedCQuaternaryLinear(nn.Linear):
     """
 
     def __init__(
-        self, in_features, out_features, bias=False, initial_c=0.375, threshold=1.0
+        self, in_features, out_features, bias=False, initial_c=0.375,
+        threshold=1.0, **kwargs
     ):
         super().__init__(in_features, out_features, bias=bias)
         self.c = nn.Parameter(torch.tensor(initial_c))
+        self.threshold = threshold
+
+    def forward(self, x):
+        quantized_weight = quaternary_weight_quantize(
+            self.weight, self.c, self.threshold
+        )
+        return F.linear(x, quantized_weight, self.bias)
+
+
+class HeterogeneousQuaternaryLinear(nn.Linear):
+    """
+    Quaternary Linear with per-projection c values hardcoded from the
+    structural fingerprinting findings (Q/K/Gate -> 0.5, V/O/Up/Down -> 0.25).
+
+    No learning, no snapping — just the optimal blueprint directly.
+    """
+
+    BLUEPRINT = {
+        "q_proj": 0.5, "k_proj": 0.5,
+        "v_proj": 0.25, "o_proj": 0.25,
+        "gate_proj": 0.5, "up_proj": 0.25, "down_proj": 0.25,
+    }
+
+    def __init__(
+        self, in_features, out_features, bias=False,
+        projection=None, threshold=1.0, **kwargs
+    ):
+        super().__init__(in_features, out_features, bias=bias)
+        c = self.BLUEPRINT.get(projection, 0.375)
+        self.register_buffer("c", torch.tensor(c))
         self.threshold = threshold
 
     def forward(self, x):

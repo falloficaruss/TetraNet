@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from model import QuaternaryLlamaForCausalLM, QuaternaryLlamaConfig
-from quaternary import FixedCQuaternaryLinear, LearnedCQuaternaryLinear
+from quaternary import FixedCQuaternaryLinear, LearnedCQuaternaryLinear, HeterogeneousQuaternaryLinear
 from regularization import AdaptiveSnappingScheduler, compute_total_loss, multi_well_potential
 
 
@@ -148,6 +148,7 @@ BASELINES = {
     "fixed_c_05": FixedCQuaternaryLinear,
     "fixed_c_075": FixedCQuaternaryLinear,
     "learned_c": LearnedCQuaternaryLinear,
+    "heterogeneous": HeterogeneousQuaternaryLinear,
 }
 
 

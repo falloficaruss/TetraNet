@@ -15,7 +15,7 @@ from models.layers import (
     BitNetTernaryLinear,
     Uniform2BitLinear,
 )
-from quaternary import FixedCQuaternaryLinear, LearnedCQuaternaryLinear
+from quaternary import FixedCQuaternaryLinear, LearnedCQuaternaryLinear, HeterogeneousQuaternaryLinear
 
 BASELINES = {
     "full_precision": FullPrecisionLinear,
@@ -25,6 +25,7 @@ BASELINES = {
     "fixed_c_05": FixedCQuaternaryLinear,
     "fixed_c_075": FixedCQuaternaryLinear,
     "learned_c": LearnedCQuaternaryLinear,
+    "heterogeneous": HeterogeneousQuaternaryLinear,
 }
 
 

@@ -112,6 +112,7 @@ class SwiGLUMLP(nn.Module):
             bias=False,
             initial_c=config.initial_c,
             threshold=config.threshold,
+            projection="gate_proj",
         )
         self.up_proj = config.linear_cls(
             config.hidden_dim,
@@ -119,6 +120,7 @@ class SwiGLUMLP(nn.Module):
             bias=False,
             initial_c=config.initial_c,
             threshold=config.threshold,
+            projection="up_proj",
         )
         self.down_proj = config.linear_cls(
             config.ffn_dim,
@@ -126,6 +128,7 @@ class SwiGLUMLP(nn.Module):
             bias=False,
             initial_c=config.initial_c,
             threshold=config.threshold,
+            projection="down_proj",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -147,6 +150,7 @@ class CausalSelfAttention(nn.Module):
             bias=False,
             initial_c=config.initial_c,
             threshold=config.threshold,
+            projection="q_proj",
         )
         self.k_proj = config.linear_cls(
             config.hidden_dim,
@@ -154,6 +158,7 @@ class CausalSelfAttention(nn.Module):
             bias=False,
             initial_c=config.initial_c,
             threshold=config.threshold,
+            projection="k_proj",
         )
         self.v_proj = config.linear_cls(
             config.hidden_dim,
@@ -161,6 +166,7 @@ class CausalSelfAttention(nn.Module):
             bias=False,
             initial_c=config.initial_c,
             threshold=config.threshold,
+            projection="v_proj",
         )
         self.o_proj = config.linear_cls(
             config.hidden_dim,
@@ -168,6 +174,7 @@ class CausalSelfAttention(nn.Module):
             bias=False,
             initial_c=config.initial_c,
             threshold=config.threshold,
+            projection="o_proj",
         )
 
         self.rotary = RotaryEmbedding(
