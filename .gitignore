@@ -4,3 +4,8 @@ findings/
 *.pt
 *.bin
 *.csv
+csr_ext/build/
+csr_ext/*.so
+*.egg-info/
+.BitNet/
+BitNet/
